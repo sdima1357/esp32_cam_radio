@@ -15,24 +15,30 @@
 
 #include "wifi.h"
 #include "radio.h"
+#include "storage.h"
 
 static const char *TAG = "weather";
 
 /*
- * Open-Meteo is free and needs no API key.  Set WX_CITY / WX_LAT / WX_LON to
- * your own location (the defaults are a neutral example).
+ * Open-Meteo is free and needs no API key.  The location comes from
+ * /spiffs/weather.txt ("city|lat|lon"); the built-in default is a neutral
+ * example.  The file is optional: without it the default is used.
  *
  * The request is done with a raw socket and static buffers on purpose: an
  * esp_http_client + cJSON fetch costs a few KB of heap exactly while an
  * HTTPS radio stream is running, and that was enough to make mbedTLS fail
  * its own buffer allocation.  A socket uses the lwIP pools instead.
  */
-#define WX_CITY         "London"
-#define WX_LAT          "51.5074"
-#define WX_LON          "-0.1278"
+#define WX_CITY_DEFAULT "London"
+#define WX_LAT_DEFAULT  "51.5074"
+#define WX_LON_DEFAULT  "-0.1278"
 #define WX_HOST         "api.open-meteo.com"
-#define WX_PATH         "/v1/forecast?latitude=" WX_LAT "&longitude=" WX_LON \
-                        "&current=temperature_2m,weather_code"
+#define WX_FILE         STORAGE_BASE_PATH "/weather.txt"
+
+static char s_city[40] = WX_CITY_DEFAULT;
+static char s_lat[16]  = WX_LAT_DEFAULT;
+static char s_lon[16]  = WX_LON_DEFAULT;
+static char s_path[128];
 
 #define WX_FIRST_MS     (10 * 1000)
 #define WX_REFRESH_MS   (15 * 60 * 1000)
@@ -147,7 +153,7 @@ static bool parse(const char *body)
     char text[48];
     snprintf(text, sizeof(text), "%d" DEG "C %s", rounded, code_text(code));
     set_text(text);
-    ESP_LOGI(TAG, "%s: %d C, code %d (%s)", WX_CITY, rounded, code,
+    ESP_LOGI(TAG, "%s: %d C, code %d (%s)", s_city, rounded, code,
              code_text(code));
     return true;
 }
@@ -189,10 +195,14 @@ static bool fetch(void)
 
     char req[192];
     int req_len = snprintf(req, sizeof(req),
-                           "GET " WX_PATH " HTTP/1.0\r\n"
+                           "GET %s HTTP/1.0\r\n"
                            "Host: " WX_HOST "\r\n"
                            "User-Agent: esp32-radio\r\n"
-                           "Connection: close\r\n\r\n");
+                           "Connection: close\r\n\r\n", s_path);
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        ESP_LOGW(TAG, "request too long");
+        goto out;
+    }
     if (send(sock, req, req_len, 0) != req_len) {
         ESP_LOGW(TAG, "send: %d", errno);
         goto out;
@@ -254,8 +264,46 @@ static void weather_task(void *arg)
     }
 }
 
+/* Optional /spiffs/weather.txt: one line "city|lat|lon". */
+static void load_location(void)
+{
+    char text[160];
+    if (storage_read(WX_FILE, text, sizeof(text)) <= 0) {
+        return;
+    }
+    char *bar1 = strchr(text, '|');
+    if (bar1 == NULL) {
+        return;
+    }
+    char *bar2 = strchr(bar1 + 1, '|');
+    if (bar2 == NULL) {
+        return;
+    }
+    *bar1 = '\0';
+    *bar2 = '\0';
+    char *lon = bar2 + 1;
+    char *nl = strpbrk(lon, "\r\n");
+    if (nl != NULL) {
+        *nl = '\0';
+    }
+    if (text[0] != '\0') {
+        strlcpy(s_city, text, sizeof(s_city));
+    }
+    if (bar1[1] != '\0') {
+        strlcpy(s_lat, bar1 + 1, sizeof(s_lat));
+    }
+    if (lon[0] != '\0') {
+        strlcpy(s_lon, lon, sizeof(s_lon));
+    }
+}
+
 esp_err_t weather_init(void)
 {
+    load_location();
+    snprintf(s_path, sizeof(s_path),
+             "/v1/forecast?latitude=%s&longitude=%s"
+             "&current=temperature_2m,weather_code", s_lat, s_lon);
+
     s_dns_done = xSemaphoreCreateBinary();
     if (s_dns_done == NULL) {
         return ESP_ERR_NO_MEM;
@@ -263,6 +311,6 @@ esp_err_t weather_init(void)
     if (xTaskCreate(weather_task, "weather", 3072, NULL, 2, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Open-Meteo for %s (%s, %s)", WX_CITY, WX_LAT, WX_LON);
+    ESP_LOGI(TAG, "Open-Meteo for %s (%s, %s)", s_city, s_lat, s_lon);
     return ESP_OK;
 }

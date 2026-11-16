@@ -34,6 +34,7 @@ idf_component_register(
         esp_http_client
         mbedtls
         esp_http_server
+        app_update
         lwip
         bt
         chmorgan__esp-libhelix-mp3

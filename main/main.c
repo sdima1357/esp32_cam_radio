@@ -19,6 +19,8 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 
 #include "board.h"
@@ -50,7 +52,12 @@ static void heap_report(void)
 
 void app_main(void)
 {
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *boot = esp_ota_get_running_partition();
     ESP_LOGI(TAG, "=== ESP32-CAM internet radio + Bluetooth speaker ===");
+    ESP_LOGI(TAG, "firmware %s (%s %s), boot partition %s",
+             app->version, app->date, app->time,
+             boot != NULL ? boot->label : "?");
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -107,6 +114,16 @@ void app_main(void)
         ESP_LOGW(TAG, "display init failed: %s", esp_err_to_name(derr));
     }
     heap_report();
+
+    /*
+     * A freshly uploaded OTA image boots in "pending verify".  WiFi, the web
+     * UI and the display are up at this point, so confirm the image and stop
+     * the bootloader from rolling back.  Harmless for a serial-flashed image.
+     */
+    esp_err_t oerr = esp_ota_mark_app_valid_cancel_rollback();
+    if (oerr != ESP_OK) {
+        ESP_LOGD(TAG, "mark valid: %s", esp_err_to_name(oerr));
+    }
 
     ESP_LOGI(TAG, "ready: open http://%s/", wifi_get_ip());
 

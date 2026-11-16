@@ -4,9 +4,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_check.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_system.h"
 
 #include "app_mode.h"
 #include "audio_out.h"
@@ -140,11 +147,12 @@ static esp_err_t index_get(httpd_req_t *req)
     char buf[512];
     snprintf(buf, sizeof(buf),
              "<h1>ESP32 Radio</h1><div class=\"sub\">%s &middot; "
-             "<a href=\"/edit\">edit stations</a></div>"
+             "<a href=\"/edit\">edit stations</a> &middot; "
+             "<a href=\"/update\">firmware %s</a></div>"
              "<div class=\"now\"><b id=\"nm\">stopped</b>"
              "<div class=\"det\" id=\"dt\">-</div>"
              "<div class=\"det\" id=\"tm\">-</div></div>",
-             wifi_get_ip());
+             wifi_get_ip(), esp_app_get_description()->version);
     httpd_resp_sendstr_chunk(req, buf);
 
     snprintf(buf, sizeof(buf),
@@ -355,6 +363,153 @@ static esp_err_t cmd_get(httpd_req_t *req)
 }
 
 /* ------------------------------------------------------------------ */
+/* OTA                                                                 */
+/* ------------------------------------------------------------------ */
+
+static esp_err_t update_get(httpd_req_t *req)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr_chunk(req, PAGE_HEAD);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "<h1>Firmware update</h1><div class=\"sub\">"
+             "<a href=\"/\">back</a></div>"
+             "<div class=\"now\"><b>%s</b>"
+             "<div class=\"det\">built %s %s &middot; running from %s "
+             "(%u KB)</div><div class=\"det\">next slot: %s (%u KB)</div></div>",
+             app->version, app->date, app->time,
+             run != NULL ? run->label : "?",
+             run != NULL ? (unsigned)(run->size / 1024) : 0,
+             next != NULL ? next->label : "none",
+             next != NULL ? (unsigned)(next->size / 1024) : 0);
+    httpd_resp_sendstr_chunk(req, buf);
+
+    httpd_resp_sendstr_chunk(req,
+        "<p>Upload <code>build/esp32_cam_radio.bin</code> from "
+        "<code>idf.py build</code>. The device writes it to the inactive "
+        "slot and reboots into it.</p>"
+        "<p><input type=\"file\" id=\"f\" accept=\".bin\"></p>"
+        "<p><button class=\"p\" onclick=\"up()\">Upload and reboot</button></p>"
+        "<div class=\"det\" id=\"st\">idle</div>"
+        "<progress id=\"pg\" value=\"0\" max=\"100\" "
+        "style=\"width:100%;height:14px\"></progress>"
+        "<script>"
+        "function up(){"
+        "var f=document.getElementById('f').files[0];"
+        "if(!f){alert('choose a .bin file');return}"
+        "var st=document.getElementById('st'),pg=document.getElementById('pg');"
+        "var x=new XMLHttpRequest();x.open('POST','/update');"
+        "x.upload.onprogress=function(e){if(e.lengthComputable){"
+        "var p=Math.round(e.loaded*100/e.total);pg.value=p;"
+        "st.textContent=p+'%  '+(e.loaded/1024|0)+' / '+(e.total/1024|0)+' KB';}};"
+        "x.onload=function(){st.textContent=x.responseText+"
+        "' - rebooting, reload in ~15 s';};"
+        "x.onerror=function(){st.textContent='upload failed';};"
+        "st.textContent='uploading...';pg.value=0;x.send(f);}"
+        "</script></body></html>");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+static esp_err_t update_post(httpd_req_t *req)
+{
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (part == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no OTA slot");
+        return ESP_FAIL;
+    }
+    if (req->content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return ESP_FAIL;
+    }
+    if ((size_t)req->content_len > part->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image too large");
+        return ESP_FAIL;
+    }
+
+    /* Stop the stream so the flash write does not fight the network task. */
+    radio_stop();
+
+    esp_ota_handle_t handle = 0;
+    esp_err_t err = esp_ota_begin(part, OTA_SIZE_UNKNOWN, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ota_begin: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(4096);
+    if (buf == NULL) {
+        esp_ota_abort(handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+
+    int remaining = req->content_len;
+    int written = 0;
+    int timeouts = 0;
+    bool ended = false;
+
+    while (remaining > 0) {
+        int want = remaining < 4096 ? remaining : 4096;
+        int r = httpd_req_recv(req, buf, want);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts > 10) {
+                err = ESP_FAIL;
+                break;
+            }
+            continue;
+        }
+        if (r <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        timeouts = 0;
+        err = esp_ota_write(handle, buf, r);
+        if (err != ESP_OK) {
+            break;
+        }
+        remaining -= r;
+        written += r;
+    }
+    free(buf);
+
+    if (err == ESP_OK) {
+        /* Validates the image header and checksum. */
+        err = esp_ota_end(handle);
+        ended = true;
+    }
+    if (err == ESP_OK) {
+        err = esp_ota_set_boot_partition(part);
+    }
+
+    if (err != ESP_OK) {
+        if (!ended) {
+            esp_ota_abort(handle);
+        }
+        ESP_LOGE(TAG, "update failed after %d bytes: %s",
+                 written, esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "update failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "update written: %d bytes to %s, rebooting",
+             written, part->label);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "OK");
+
+    /* Let the response leave the socket before the reset. */
+    vTaskDelay(pdMS_TO_TICKS(800));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
 
 esp_err_t webui_start(void)
 {
@@ -378,6 +533,8 @@ esp_err_t webui_start(void)
         { .uri = "/save",       .method = HTTP_POST, .handler = save_post  },
         { .uri = "/api/status", .method = HTTP_GET,  .handler = status_get },
         { .uri = "/api/cmd",    .method = HTTP_GET,  .handler = cmd_get    },
+        { .uri = "/update",     .method = HTTP_GET,  .handler = update_get },
+        { .uri = "/update",     .method = HTTP_POST, .handler = update_post },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &uris[i]),

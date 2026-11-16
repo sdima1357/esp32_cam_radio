@@ -36,6 +36,8 @@ The encoder or the web UI switches between the two modes.
 - PSRAM is used for the audio ring buffer and WiFi/LwIP allocations
 - Flash and PSRAM both run at **80 MHz** (`CONFIG_ESPTOOLPY_FLASHFREQ_80M`,
   `CONFIG_SPIRAM_SPEED_80M`) for maximum performance
+- **OTA updates** from the web UI (dual-bank layout, automatic rollback of a
+  bad image)
 
 ## Hardware
 
@@ -239,6 +241,8 @@ Open `http://<device-ip>/` (the IP is printed on the serial console at boot).
 | `/save` | POST | Save the station list (`text=` form field) |
 | `/api/status` | GET | JSON: radio state, mode, BT state, volume, WiFi, IP, RSSI, time |
 | `/api/cmd` | GET | Commands (see below) |
+| `/update` | GET | Firmware update page (version, slots, upload form) |
+| `/update` | POST | Upload a `.bin`; body is the raw image (see **Firmware update**) |
 
 Commands for `/api/cmd`:
 
@@ -303,10 +307,72 @@ and an auto-reset circuit on **IO0** and **EN** (DTR/RTS). Port:
 `/dev/ttyUSB0`. The FTDI must be set to **3.3 V I/O** (or at least the ESP32
 side must not see 5 V on RX/TX).
 
+## Firmware update (OTA)
+
+The 4 MB flash is split into two 1.75 MB application slots plus a 448 KB
+SPIFFS partition, so the device can update itself over WiFi:
+
+```
+nvs        0x009000   16 KB
+otadata    0x00d000    8 KB
+phy_init   0x00f000    4 KB
+ota_0      0x010000  1.75 MB
+ota_1      0x1d0000  1.75 MB
+storage    0x390000   448 KB
+```
+
+The running image is about 1.5 MB, leaving ~16 % headroom in each slot.
+
+### From the browser
+
+1. Build: `idf.py build`
+2. Open `http://<device-ip>/update`
+3. Choose `build/esp32_cam_radio.bin` and press **Upload and reboot**
+
+The page shows the running version, the slot it booted from and the slot that
+will be written. The image is streamed straight into flash (4 KB chunks), so
+no large RAM buffer is needed. The radio is stopped before the write starts.
+
+### From the command line
+
+```bash
+curl --data-binary @build/esp32_cam_radio.bin http://192.168.1.50/update
+```
+
+The response is `OK`; the device reboots about a second later.
+
+### Rollback
+
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` puts every uploaded image on
+probation. The new firmware marks itself valid in `main.c` once WiFi, the web
+UI and the display are up. If it crashes before that, the bootloader boots the
+previous slot again on the next reset.
+
+The app version comes from `CONFIG_APP_PROJECT_VER` in `sdkconfig.defaults`.
+Bump it for each release:
+
+```
+CONFIG_APP_PROJECT_VER="1.0.1"
+```
+
+The version is printed on the serial console at boot, shown on the `/update`
+page and linked from the main page.
+
+### Notes
+
+- `idf.py flash` still works over USB and writes `ota_0`; the first OTA update
+  then goes to `ota_1`.
+- The station list and WiFi credentials live in SPIFFS and survive updates.
+- Changing `partitions.csv` changes the SPIFFS offset. Back up
+  `/spiffs/wifi.txt` and `/spiffs/stations.txt` before re-partitioning, or the
+  device will come up with the default (placeholder) credentials.
+- The upload is unauthenticated. Anyone on the same network can flash the
+  device, so keep it on a trusted LAN.
+
 ## Configuration files
 
-Both files live on the SPIFFS `storage` partition and are created with defaults
-on first boot.
+All files live on the SPIFFS `storage` partition. `stations.txt` and
+`wifi.txt` are created with defaults on first boot; `weather.txt` is optional.
 
 ### `/spiffs/stations.txt`
 
@@ -342,6 +408,24 @@ pass=AnotherPassword
 At boot the device scans and joins the configured network with the strongest
 signal. If a network fails repeatedly it is skipped for a while and the
 next-best is tried.
+
+### `/spiffs/weather.txt` (optional)
+
+Weather location for Open-Meteo, one line:
+
+```
+City name|latitude|longitude
+```
+
+Example:
+
+```
+London|51.5074|-0.1278
+```
+
+If the file is missing, the built-in default (`London|51.5074|-0.1278`) is
+used. The city name is only shown on the display and in the log; the request
+uses the coordinates.
 
 ## Time and date (NTP)
 
@@ -380,6 +464,8 @@ Bluetooth A2DP sink ──────PCM──────────┘
   the status JSON and the page buffer are built on the stack.
 - Bluetooth classic + Bluedroid + A2DP cost roughly 60–80 KB of internal RAM;
   the stack is initialised once at boot and kept idle in radio mode.
+- OTA: the upload is streamed in 4 KB chunks straight to flash, so the update
+  path costs no extra RAM. The image is ~1.5 MB of the 1.75 MB slot.
 
 ## Project layout
 
@@ -397,7 +483,7 @@ main/
   encoder.c     KY-040 quadrature decode, volume, short/long press
   weather.c     Open-Meteo fetch over a raw socket (static buffers)
   display.c     ST7789 init, strip renderer and UI refresh task
-  webui.c       HTTP server and web pages
+  webui.c       HTTP server, web pages and OTA upload
   console.c     UART0 command console
   storage.c     SPIFFS mount and file helpers
   status_led.c  on-board LED patterns
@@ -415,5 +501,7 @@ tools/
 - Volume is not persisted across reboots (always starts at 20).
 - Time is only available after the first NTP reply (needs internet access).
 - Only one source at a time: Bluetooth mode stops the radio and vice versa.
+- OTA upload is unauthenticated and only available over plain HTTP on the
+  local network.
 - The brownout detector is disabled until the 5 V supply is improved (see
   **Power** above).
