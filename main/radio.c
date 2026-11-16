@@ -29,6 +29,9 @@ static const char *TAG = "radio";
 
 static volatile int s_want = -1;    /* requested station, -1 = stopped */
 static volatile int s_index = -1;   /* station being streamed */
+/* Bumped on every play request so that pressing play on the station that is
+ * already streaming (e.g. after editing its URL) reconnects. */
+static volatile uint32_t s_generation = 0;
 static volatile radio_state_t s_state = RADIO_STOPPED;
 static volatile uint32_t s_bitrate = 0;
 static volatile uint32_t s_rate = 0;
@@ -142,12 +145,12 @@ static void decode_buffer(int *fill, bool *got_frame)
 /* Streaming                                                           */
 /* ------------------------------------------------------------------ */
 
-static bool station_changed(int index)
+static bool station_changed(int index, uint32_t generation)
 {
-    return s_want != index;
+    return s_want != index || s_generation != generation;
 }
 
-static void stream_station(int index, const char *url)
+static void stream_station(int index, const char *url, uint32_t generation)
 {
     esp_http_client_config_t cfg = {
         .url = url,
@@ -176,20 +179,54 @@ static void stream_station(int index, const char *url)
     set_detail("connecting...");
     set_state(RADIO_CONNECTING);
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
-        set_detail("connect failed (%s)", esp_err_to_name(err));
-        set_state(RADIO_ERROR);
-        esp_http_client_cleanup(client);
-        return;
-    }
+    /*
+     * esp_http_client only follows redirects inside esp_http_client_perform().
+     * This code uses open/read for streaming, so handle 3xx here.  Some
+     * stations (e.g. SRG SSR) answer with a temporary redirect to the actual
+     * stream server.
+     */
+    int status = 0;
+    int64_t content_len = 0;
+    for (int hop = 0; ; hop++) {
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
+            set_detail("connect failed (%s)", esp_err_to_name(err));
+            set_state(RADIO_ERROR);
+            esp_http_client_cleanup(client);
+            return;
+        }
 
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    int64_t content_len = esp_http_client_get_content_length(client);
-    ESP_LOGI(TAG, "http %d, content-length %lld, heap %" PRIu32,
-             status, (long long)content_len, esp_get_free_heap_size());
+        esp_http_client_fetch_headers(client);
+        status = esp_http_client_get_status_code(client);
+        content_len = esp_http_client_get_content_length(client);
+        ESP_LOGI(TAG, "http %d, content-length %lld, heap %" PRIu32,
+                 status, (long long)content_len, esp_get_free_heap_size());
+
+        bool redirect = status == 301 || status == 302 || status == 303 ||
+                        status == 307 || status == 308;
+        if (!redirect) {
+            break;
+        }
+        if (hop >= 5) {
+            ESP_LOGW(TAG, "too many redirects");
+            set_detail("redirect loop");
+            set_state(RADIO_ERROR);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return;
+        }
+        esp_http_client_close(client);
+        if (esp_http_client_set_redirection(client) != ESP_OK) {
+            ESP_LOGW(TAG, "redirect %d without a usable Location", status);
+            set_detail("bad redirect");
+            set_state(RADIO_ERROR);
+            esp_http_client_cleanup(client);
+            return;
+        }
+        ESP_LOGI(TAG, "redirect %d, following", status);
+        set_detail("redirect...");
+    }
 
     if (status != 200) {
         set_detail("http %d", status);
@@ -209,7 +246,7 @@ static void stream_station(int index, const char *url)
     bool got_frame = false;
     uint32_t last_log = 0;
 
-    while (!station_changed(index)) {
+    while (!station_changed(index, generation)) {
         if (fill == IN_BUF_SIZE) {
             /* Decoder could not consume anything: drop the buffer. */
             ESP_LOGW(TAG, "input buffer full, dropping");
@@ -271,6 +308,7 @@ static void radio_task(void *arg)
 
     for (;;) {
         int want = s_want;
+        uint32_t generation = s_generation;
 
         if (want < 0) {
             fails = 0;
@@ -322,9 +360,9 @@ static void radio_task(void *arg)
         s_index = want;
         ESP_LOGI(TAG, "play %d: %s", want, st->name);
 
-        stream_station(want, st->url);
+        stream_station(want, st->url, generation);
 
-        if (s_want != want) {
+        if (s_want != want || s_generation != generation) {
             fails = 0;
             continue;                   /* user moved on */
         }
@@ -368,6 +406,7 @@ esp_err_t radio_play(int index)
     }
     s_index = index;
     s_want = index;
+    s_generation++;
     set_state(RADIO_CONNECTING);
     set_detail("starting");
     return ESP_OK;

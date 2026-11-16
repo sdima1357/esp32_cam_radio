@@ -50,13 +50,28 @@ void app_mode_set(app_mode_t mode)
         s_mode = APP_MODE_BT;
         radio_stop();
         audio_out_flush();
-        esp_err_t err = bt_audio_set_enabled(true);
+        /* The stack is only brought up now: see bt_audio.h. */
+        esp_err_t err = bt_audio_ensure_init();
+        if (err == ESP_OK) {
+            err = bt_audio_set_enabled(true);
+        }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "BT enable failed: %s", esp_err_to_name(err));
+            /* Stay in radio mode rather than showing a dead Bluetooth page. */
+            s_mode = APP_MODE_RADIO;
+            int idx = radio_get_index();
+            if (idx < 0 && stations_count() > 0) {
+                idx = 0;
+            }
+            if (idx >= 0) {
+                radio_play(idx);
+            }
         }
     } else {
         s_mode = APP_MODE_RADIO;
         bt_audio_set_enabled(false);
+        /* Release the BT stack so HTTPS streaming has the internal RAM. */
+        bt_audio_deinit();
         audio_out_flush();
 
         int idx = radio_get_index();

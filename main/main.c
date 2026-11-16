@@ -44,9 +44,11 @@ static const char *TAG = "app";
 static void heap_report(void)
 {
     ESP_LOGI(TAG, "free heap: %" PRIu32 " bytes, largest block: %" PRIu32
-                  ", PSRAM free: %u KB",
+                  ", internal free: %u, internal largest: %u, PSRAM free: %u KB",
              esp_get_free_heap_size(),
              (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 }
 
@@ -93,14 +95,12 @@ void app_main(void)
     ESP_ERROR_CHECK(radio_init());
 
     /*
-     * Bring the classic BT stack up once at boot so switching modes is
-     * instant.  It stays non-discoverable until Bluetooth mode is selected.
-     * A failure must not stop the radio.
+     * The Bluetooth stack is started on demand (first switch to Bluetooth
+     * mode) and released when the radio is selected again: it needs 60-90 KB
+     * of internal RAM that the HTTPS client needs for its TLS handshake.
+     * preinit only creates the semaphores used by the lazy init.
      */
-    esp_err_t berr = bt_audio_init();
-    if (berr != ESP_OK) {
-        ESP_LOGW(TAG, "Bluetooth init failed: %s", esp_err_to_name(berr));
-    }
+    bt_audio_preinit();
 
     app_mode_init();
 

@@ -28,6 +28,7 @@ static const char *TAG = "encoder";
 
 /* Ignore button bounces / repeated presses within this window. */
 #define ENC_BTN_DEBOUNCE_US (200 * 1000)
+#define ENC_BTN_STARTUP_US  (500 * 1000)
 
 /* Drop contact noise this soon after an edge in the ISR itself. */
 #define ENC_BTN_GLITCH_US   (30 * 1000)
@@ -125,7 +126,11 @@ static void encoder_task(void *arg)
     enc_ev_t ev;
     int64_t last_btn = 0;
     int64_t press_start = 0;
-    bool btn_armed = true;
+    /* Start disarmed and ignore button edges for a moment: configuring the
+     * SW pin (and the KY-040's own pull-up) can produce a spurious press at
+     * boot, which would otherwise skip the first station. */
+    const int64_t start_us = esp_timer_get_time();
+    bool btn_armed = false;
     bool btn_down = false;
 
     for (;;) {
@@ -175,6 +180,9 @@ static void encoder_task(void *arg)
                 continue;
             }
             int64_t now = esp_timer_get_time();
+            if (now - start_us < ENC_BTN_STARTUP_US) {
+                continue;
+            }
             if (now - last_btn < ENC_BTN_DEBOUNCE_US) {
                 continue;
             }

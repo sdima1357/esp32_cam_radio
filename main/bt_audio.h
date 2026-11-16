@@ -17,8 +17,23 @@ typedef enum {
     BT_AUDIO_PLAYING,
 } bt_audio_state_t;
 
+/*
+ * The BT stack is brought up on demand, not at boot: it needs 60-90 KB of
+ * internal RAM that the HTTPS client needs for its TLS handshake.  Call
+ * bt_audio_preinit() once at startup (it only creates two semaphores), then
+ * bt_audio_ensure_init() before using Bluetooth.  bt_audio_deinit() releases
+ * the memory again when the radio is selected.
+ */
+void bt_audio_preinit(void);
+
 /* Initialise the classic BT controller, Bluedroid, A2DP sink and AVRCP. */
 esp_err_t bt_audio_init(void);
+
+/* Idempotent: initialise the stack (in a dedicated task) if needed. */
+esp_err_t bt_audio_ensure_init(void);
+
+/* Tear the stack down and return its internal RAM to the heap. */
+esp_err_t bt_audio_deinit(void);
 
 /* Make the speaker discoverable/connectable, or disconnect and hide it. */
 esp_err_t bt_audio_set_enabled(bool enabled);

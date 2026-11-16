@@ -16,7 +16,8 @@ The encoder or the web UI switches between the two modes.
 
 ## Features
 
-- MP3 streaming over `http://` and `https://` (TLS 1.2, built-in CA bundle)
+- MP3 streaming over `http://` and `https://` (TLS 1.2, built-in CA bundle,
+  HTTP redirects followed)
 - 44.1 kHz and 48 kHz streams; the I2S clock is reconfigured per stream
 - Bluetooth classic A2DP sink + AVRCP (play/pause, absolute volume)
 - Editable station list in `/spiffs/stations.txt`
@@ -214,12 +215,15 @@ transfer-complete callback before reusing the buffer.
 
 ## Bluetooth
 
-At boot the classic BT controller and Bluedroid are initialised, but the
-device stays non-discoverable while in radio mode. Selecting Bluetooth mode:
+The classic BT stack is started on the **first** switch to Bluetooth mode and
+released again when the radio is selected. It needs 60–90 KB of internal RAM,
+which the HTTPS client needs for its TLS handshake, so keeping it idle in
+radio mode made some HTTPS streams fail. Selecting Bluetooth mode:
 
 1. stops the radio stream and flushes the PCM buffer,
-2. makes the device discoverable as `ESP32-CAM Radio`,
-3. accepts SSP "just works" pairing (legacy PIN `1234` as fallback).
+2. starts the BT controller, Bluedroid, A2DP and AVRCP (takes about a second),
+3. makes the device discoverable as `ESP32-CAM Radio`,
+4. accepts SSP "just works" pairing (legacy PIN `1234` as fallback).
 
 A phone connects as an A2DP source. The sink receives 44.1 kHz stereo 16-bit
 PCM and pushes it into the same I2S ring buffer as the radio. AVRCP is enabled
@@ -228,7 +232,8 @@ in both directions:
 - the encoder/console/web can send play/pause to the phone,
 - the phone's absolute volume control changes the local volume.
 
-Switching back to radio disconnects A2DP and restarts the last station.
+Switching back to radio disconnects A2DP, tears the BT stack down (returning
+its RAM to the heap) and restarts the last station.
 
 ## Web UI
 
@@ -465,8 +470,16 @@ Bluetooth A2DP sink ──────PCM──────────┘
 - Web UI: the `/edit` handler streams the station file in 128-byte chunks and
   `/save` decodes the form body in place. The httpd task stack is 5 KB because
   the status JSON and the page buffer are built on the stack.
-- Bluetooth classic + Bluedroid + A2DP cost roughly 60–80 KB of internal RAM;
-  the stack is initialised once at boot and kept idle in radio mode.
+- Bluetooth classic + Bluedroid + A2DP cost roughly 60–90 KB of internal RAM.
+  The stack is created on the first switch to Bluetooth mode and deleted when
+  the radio is selected again, so radio-only operation keeps the full internal
+  heap for TLS.
+- mbedTLS uses the default allocator (`CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC`):
+  large TLS buffers land in PSRAM, small ones in internal RAM. With the
+  internal-only allocator the 16 KB input buffer did not fit next to WiFi.
+- The radio uses `esp_http_client_open()` + `read()` for streaming, and that
+  path does not follow redirects by itself, so `radio.c` follows 3xx
+  `Location` headers (up to 5 hops). Some stations (e.g. SRG SSR) need it.
 - OTA: the upload is streamed in 4 KB chunks straight to flash, so the update
   path costs no extra RAM. The image is ~1.5 MB of the 1.75 MB slot.
 

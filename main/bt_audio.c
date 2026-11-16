@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_system.h"
@@ -34,6 +35,21 @@ static char s_remote_name[ESP_BT_GAP_MAX_BDNAME_LEN + 1] = "";
 static char s_detail[64] = "off";
 
 static bool s_stack_ready = false;
+
+/*
+ * The classic BT stack costs 60-90 KB of internal RAM, which the HTTPS
+ * client needs for its TLS handshake.  It is therefore brought up lazily on
+ * the first switch to Bluetooth mode and torn down again when the radio is
+ * selected, so radio-only operation always has the full internal heap.
+ */
+static SemaphoreHandle_t s_init_mutex = NULL;
+static SemaphoreHandle_t s_init_done = NULL;
+static esp_err_t s_init_result = ESP_ERR_INVALID_STATE;
+static bool s_init_started = false;
+
+#define BT_INIT_TASK_STACK  6144
+#define BT_INIT_TASK_PRIO   5
+#define BT_INIT_TIMEOUT_MS  15000
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -242,6 +258,67 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
+void bt_audio_preinit(void)
+{
+    if (s_init_mutex == NULL) {
+        s_init_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_init_done == NULL) {
+        s_init_done = xSemaphoreCreateBinary();
+    }
+}
+
+static void bt_init_task(void *arg)
+{
+    (void)arg;
+    s_init_result = bt_audio_init();
+    xSemaphoreGive(s_init_done);
+    vTaskDelete(NULL);
+}
+
+esp_err_t bt_audio_ensure_init(void)
+{
+    if (s_stack_ready) {
+        return ESP_OK;
+    }
+    if (s_init_mutex == NULL || s_init_done == NULL) {
+        bt_audio_preinit();
+    }
+    if (s_init_mutex == NULL || s_init_done == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    /* Serialise concurrent calls (web UI, encoder, console). */
+    if (xSemaphoreTake(s_init_mutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (s_stack_ready) {
+        err = ESP_OK;
+    } else if (!s_init_started) {
+        s_init_started = true;
+        if (xTaskCreate(bt_init_task, "bt_init", BT_INIT_TASK_STACK, NULL,
+                        BT_INIT_TASK_PRIO, NULL) != pdPASS) {
+            s_init_started = false;
+            err = ESP_ERR_NO_MEM;
+        } else if (xSemaphoreTake(s_init_done,
+                                  pdMS_TO_TICKS(BT_INIT_TIMEOUT_MS)) != pdTRUE) {
+            err = ESP_ERR_TIMEOUT;
+        } else {
+            err = s_init_result;
+            if (err != ESP_OK) {
+                /* Allow a later retry. */
+                s_init_started = false;
+            }
+        }
+    } else {
+        err = s_init_result;
+    }
+
+    xSemaphoreGive(s_init_mutex);
+    return err;
+}
+
 esp_err_t bt_audio_init(void)
 {
     if (s_stack_ready) {
@@ -298,6 +375,67 @@ esp_err_t bt_audio_init(void)
     set_detail("off");
     ESP_LOGI(TAG, "ready as \"%s\" (heap %" PRIu32 ")",
              BOARD_BT_NAME, esp_get_free_heap_size());
+    return ESP_OK;
+}
+
+esp_err_t bt_audio_deinit(void)
+{
+    if (!s_stack_ready) {
+        return ESP_OK;
+    }
+
+    /* Disconnect and hide before tearing the stack down. */
+    if (s_enabled) {
+        bt_audio_set_enabled(false);
+        /* Let the asynchronous A2DP disconnect complete first. */
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    esp_err_t err = esp_a2d_sink_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "a2dp deinit: %s", esp_err_to_name(err));
+    }
+    err = esp_avrc_tg_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "avrc tg deinit: %s", esp_err_to_name(err));
+    }
+    err = esp_avrc_ct_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "avrc ct deinit: %s", esp_err_to_name(err));
+    }
+    err = esp_bluedroid_disable();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "bluedroid disable: %s", esp_err_to_name(err));
+    }
+    err = esp_bluedroid_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "bluedroid deinit: %s", esp_err_to_name(err));
+    }
+    err = esp_bt_controller_disable();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "controller disable: %s", esp_err_to_name(err));
+    }
+    err = esp_bt_controller_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "controller deinit: %s", esp_err_to_name(err));
+    }
+    /* Give the controller's static memory back to the internal heap. */
+    err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "BT memory release: %s", esp_err_to_name(err));
+    }
+
+    s_stack_ready = false;
+    s_enabled = false;
+    s_connected = false;
+    s_playing = false;
+    s_avrc_connected = false;
+    s_remote_name[0] = '\0';
+    s_state = BT_AUDIO_OFF;
+    set_detail("off");
+    status_led_set(LED_MODE_OFF);
+
+    ESP_LOGI(TAG, "stack released (heap %" PRIu32 ")", esp_get_free_heap_size());
     return ESP_OK;
 }
 
