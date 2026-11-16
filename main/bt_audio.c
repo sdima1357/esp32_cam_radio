@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -293,26 +294,28 @@ esp_err_t bt_audio_ensure_init(void)
     }
 
     esp_err_t err = ESP_OK;
-    if (s_stack_ready) {
-        err = ESP_OK;
-    } else if (!s_init_started) {
-        s_init_started = true;
-        if (xTaskCreate(bt_init_task, "bt_init", BT_INIT_TASK_STACK, NULL,
-                        BT_INIT_TASK_PRIO, NULL) != pdPASS) {
-            s_init_started = false;
-            err = ESP_ERR_NO_MEM;
-        } else if (xSemaphoreTake(s_init_done,
-                                  pdMS_TO_TICKS(BT_INIT_TIMEOUT_MS)) != pdTRUE) {
-            err = ESP_ERR_TIMEOUT;
-        } else {
-            err = s_init_result;
-            if (err != ESP_OK) {
-                /* Allow a later retry. */
+    if (!s_stack_ready) {
+        if (!s_init_started) {
+            s_init_started = true;
+            if (xTaskCreate(bt_init_task, "bt_init", BT_INIT_TASK_STACK, NULL,
+                            BT_INIT_TASK_PRIO, NULL) != pdPASS) {
                 s_init_started = false;
+                err = ESP_ERR_NO_MEM;
             }
         }
-    } else {
-        err = s_init_result;
+        if (err == ESP_OK) {
+            /* Also waits for an init started by an earlier, timed-out call. */
+            if (xSemaphoreTake(s_init_done,
+                               pdMS_TO_TICKS(BT_INIT_TIMEOUT_MS)) != pdTRUE) {
+                err = ESP_ERR_TIMEOUT;
+            } else {
+                err = s_init_result;
+                if (err != ESP_OK) {
+                    /* Allow a later retry. */
+                    s_init_started = false;
+                }
+            }
+        }
     }
 
     xSemaphoreGive(s_init_mutex);
@@ -373,8 +376,9 @@ esp_err_t bt_audio_init(void)
     s_stack_ready = true;
     s_state = BT_AUDIO_OFF;
     set_detail("off");
-    ESP_LOGI(TAG, "ready as \"%s\" (heap %" PRIu32 ")",
-             BOARD_BT_NAME, esp_get_free_heap_size());
+    ESP_LOGI(TAG, "ready as \"%s\" (heap %" PRIu32 ", internal free %u)",
+             BOARD_BT_NAME, esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     return ESP_OK;
 }
 
@@ -382,6 +386,13 @@ esp_err_t bt_audio_deinit(void)
 {
     if (!s_stack_ready) {
         return ESP_OK;
+    }
+
+    /* Do not race with an init in progress. */
+    if (s_init_mutex != NULL) {
+        if (xSemaphoreTake(s_init_mutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
     }
 
     /* Disconnect and hide before tearing the stack down. */
@@ -419,11 +430,13 @@ esp_err_t bt_audio_deinit(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "controller deinit: %s", esp_err_to_name(err));
     }
-    /* Give the controller's static memory back to the internal heap. */
-    err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "BT memory release: %s", esp_err_to_name(err));
-    }
+    /*
+     * Deliberately no esp_bt_controller_mem_release() here: it hands the
+     * controller's reserved regions to the general heap, so a later
+     * esp_bt_controller_init() would use memory that may already be
+     * allocated.  The dynamic allocations freed above are what the TLS
+     * handshake needs; the static regions were never part of the heap.
+     */
 
     s_stack_ready = false;
     s_enabled = false;
@@ -435,7 +448,17 @@ esp_err_t bt_audio_deinit(void)
     set_detail("off");
     status_led_set(LED_MODE_OFF);
 
-    ESP_LOGI(TAG, "stack released (heap %" PRIu32 ")", esp_get_free_heap_size());
+    /* Allow the next Bluetooth switch to start the stack again. */
+    s_init_started = false;
+    s_init_result = ESP_ERR_INVALID_STATE;
+
+    ESP_LOGI(TAG, "stack released (heap %" PRIu32 ", internal free %u)",
+             esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    if (s_init_mutex != NULL) {
+        xSemaphoreGive(s_init_mutex);
+    }
     return ESP_OK;
 }
 
