@@ -1,0 +1,40 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "audio_out.c"
+        "status_led.c"
+        "storage.c"
+        "stations.c"
+        "wifi.c"
+        "radio.c"
+        "webui.c"
+        "console.c"
+        "clock.c"
+        "encoder.c"
+        "display.c"
+        "weather.c"
+        "font8x16_ru.c"
+        "bt_audio.c"
+        "app_mode.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        nvs_flash
+        esp_driver_i2s
+        esp_driver_ledc
+        esp_ringbuf
+        esp_driver_gpio
+        esp_driver_uart
+        esp_driver_spi
+        esp_lcd
+        esp_timer
+        spiffs
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_http_client
+        mbedtls
+        esp_http_server
+        lwip
+        bt
+        chmorgan__esp-libhelix-mp3
+)

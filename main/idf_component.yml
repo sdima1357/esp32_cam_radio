@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=5.0.0'
+  # MP3 decoder used by the internet radio.
+  chmorgan/esp-libhelix-mp3: ^1.0.3

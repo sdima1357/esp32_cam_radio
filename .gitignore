@@ -1,0 +1,13 @@
+# ESP-IDF build output
+build/
+managed_components/
+
+# Generated configuration (use sdkconfig.defaults as the source of truth)
+sdkconfig
+sdkconfig.old
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
