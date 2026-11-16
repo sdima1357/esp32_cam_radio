@@ -368,6 +368,9 @@ page and linked from the main page.
   device will come up with the default (placeholder) credentials.
 - The upload is unauthenticated. Anyone on the same network can flash the
   device, so keep it on a trusted LAN.
+- `CONFIG_ESP_TASK_WDT_TIMEOUT_S=10`: a full RF calibration on the first boot
+  after a reset can take several seconds, and the 5 s default would reset the
+  chip mid-calibration and roll back a fresh OTA image.
 
 ## Configuration files
 

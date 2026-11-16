@@ -16,6 +16,10 @@ CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
 CONFIG_APP_PROJECT_VER="1.0.0"
 
 # ---- FreeRTOS / system ----
+# A full RF calibration on the first boot after a reset can take several
+# seconds.  With the 5 s default the task watchdog resets the chip in the
+# middle of it, which also rolls back a freshly uploaded OTA image.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
