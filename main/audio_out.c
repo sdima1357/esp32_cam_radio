@@ -17,10 +17,10 @@
 static const char *TAG = "audio";
 
 /* Enough to ride out WiFi/TLS hiccups without adding a lot of latency. */
-#define RINGBUF_SIZE        (46 * 1024)
+#define RINGBUF_SIZE        (96 * 1024)
 #define WRITE_CHUNK         (1024)
 /* Start playing only once this much audio is buffered (live streams jitter). */
-#define PREFILL_BYTES       (24 * 1024)
+#define PREFILL_BYTES       (48 * 1024)
 #define PREFILL_TIMEOUT_MS  2000
 
 static i2s_chan_handle_t s_tx = NULL;
@@ -31,7 +31,7 @@ static TaskHandle_t s_task = NULL;
 static volatile bool s_muted = false;
 static volatile bool s_prefill = false;
 static volatile uint32_t s_prefill_start = 0;
-static volatile int s_volume = 20;
+static volatile int s_volume = 10;
 
 static volatile uint32_t s_bytes_in = 0;    /* queued by a source */
 static volatile uint32_t s_bytes_out = 0;   /* written to I2S */

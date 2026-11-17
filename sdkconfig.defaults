@@ -20,6 +20,13 @@ CONFIG_APP_PROJECT_VER="1.0.0"
 # seconds.  With the 5 s default the task watchdog resets the chip in the
 # middle of it, which also rolls back a freshly uploaded OTA image.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# The RF calibration also runs with interrupts disabled, so the interrupt
+# watchdog (800 ms default with PSRAM) resets the chip *before* the task
+# watchdog ever gets a chance.  If the stored calibration data fails its
+# checksum the chip recalibrates on every boot, and with the 800 ms limit it
+# can never finish and save the result: a permanent boot loop.  Give the
+# calibration the same 10 s budget as the task watchdog.
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=10000
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072

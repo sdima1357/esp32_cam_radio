@@ -33,7 +33,7 @@ The encoder or the web UI switches between the two modes.
 - Current weather for a configurable location from Open-Meteo (no API key)
 - Status LED: on = playing/connected, slow blink = discoverable/error,
   off = stopped
-- 46 KB PCM ring buffer in PSRAM with pre-buffering to absorb network jitter
+- 96 KB PCM ring buffer in PSRAM with pre-buffering to absorb network jitter
 - PSRAM is used for the audio ring buffer and WiFi/LwIP allocations
 - Flash and PSRAM both run at **80 MHz** (`CONFIG_ESPTOOLPY_FLASHFREQ_80M`,
   `CONFIG_SPIRAM_SPEED_80M`) for maximum performance
@@ -165,7 +165,12 @@ The on-board red LED on GPIO33 is active low. Patterns:
 The ESP32-CAM needs a **stable 5 V supply of at least 1 A**. WiFi and Bluetooth
 RF calibration draw short current peaks that a small FTDI 5 V pin cannot
 sustain; with a weak supply the board browns out and reboots during boot or
-while streaming.
+while streaming. A marginal rail can also show up as short audio dropouts
+while the radio plays, or as a boot loop at the RF-calibration step (the
+calibration data write is corrupted, so every boot tries a full recalibration
+and the interrupt watchdog resets it). If the serial log shows
+`TG0WDT_SYS_RESET` / `TG1WDT_SYS_RESET` right after `phy_init: phy_version`,
+check the supply before suspecting the firmware.
 
 The current `sdkconfig.defaults` has the brownout detector **temporarily
 disabled** so the board can be tested on the FTDI supply:
@@ -378,9 +383,14 @@ page and linked from the main page.
   device will come up with the default (placeholder) credentials.
 - The upload is unauthenticated. Anyone on the same network can flash the
   device, so keep it on a trusted LAN.
-- `CONFIG_ESP_TASK_WDT_TIMEOUT_S=10`: a full RF calibration on the first boot
-  after a reset can take several seconds, and the 5 s default would reset the
-  chip mid-calibration and roll back a fresh OTA image.
+- `CONFIG_ESP_TASK_WDT_TIMEOUT_S=10` and `CONFIG_ESP_INT_WDT_TIMEOUT_MS=10000`:
+  a full RF calibration on the first boot after a reset can take several
+  seconds, and it runs with interrupts disabled. The 5 s task-watchdog default
+  would reset the chip mid-calibration (rolling back a fresh OTA image), and
+  the 800 ms interrupt-watchdog default would reset it even earlier. If the
+  calibration data in NVS fails its checksum the chip recalibrates on every
+  boot; with the short interrupt-watchdog limit it could never finish and save
+  the result, which turned a bad checksum into a permanent boot loop.
 
 ## Configuration files
 
@@ -453,20 +463,20 @@ status reports `not synced`.
 
 ```
 HTTP(S) ──> MP3 decoder (helix) ──PCM──┐
-                                       ├──> 46 KB ring (PSRAM) ──> volume ──> I2S ──> PCM5102A
+                                       ├──> 96 KB ring (PSRAM) ──> volume ──> I2S ──> PCM5102A
 Bluetooth A2DP sink ──────PCM──────────┘
 ```
 
 - The writer task is pinned to core 1; core 0 handles WiFi and the network
   stack.
-- Playback starts only after 24 KB of PCM is buffered (or ~2 s).
+- Playback starts only after 48 KB of PCM is buffered (or ~2 s).
 - The I2S sample rate follows the source (44.1 kHz or 48 kHz).
 - The ring buffer is allocated in PSRAM; the I2S driver copies each chunk into
   its own internal DMA buffers.
 
 ## Memory notes
 
-- 46 KB PCM ring buffer in PSRAM (≈240 ms at 48 kHz)
+- 96 KB PCM ring buffer in PSRAM (≈500 ms at 48 kHz)
 - 16 KB mbedTLS input buffer (needed for servers that send 16 KB TLS records)
 - `CONFIG_LWIP_MAX_SOCKETS=8` so the web UI keeps working while a stream is open
 - `CONFIG_HTTPD_MAX_REQ_HDR_LEN=3072` (the 512-byte default rejects browser
@@ -501,7 +511,7 @@ main/
   board.h       pin map, LCD geometry and camera-adapter mapping
   app_mode.c    radio/Bluetooth mode switch
   bt_audio.c    classic BT controller, A2DP sink, AVRCP, SSP
-  audio_out.c   I2S TX, 46 KB PSRAM ring, writer task, volume, beep
+  audio_out.c   I2S TX, 96 KB PSRAM ring, writer task, volume, beep
   radio.c       HTTP(S) streaming, helix MP3 decode, station switching
   stations.c    station list parse/save, built-in defaults
   wifi.c        multi-network scan, best-signal connect, reconnect
