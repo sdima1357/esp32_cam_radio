@@ -13,7 +13,7 @@ static station_t s_stations[STATION_MAX];
 static int s_count = 0;
 
 /* Bump the marker when the default list changes, so an old file is replaced. */
-#define LIST_VERSION "# v2"
+#define LIST_VERSION "# v3"
 
 static const char *DEFAULT_LIST =
     LIST_VERSION "\n"
@@ -29,7 +29,14 @@ static const char *DEFAULT_LIST =
     "Dorozhnoe Radio|http://dorognoe.hostingradio.ru:8000/dorognoe\n"
     "Evropa Plus|http://ep128.hostingradio.ru:8030/ep128\n"
     "Retro FM|http://retroserver.streamr.ru:8043/retro256.mp3\n"
-    "Vesti FM|http://radio.vgtrk.cdnvideo.ru/vesti_fm_mp3_128k\n";
+    "181.FM Classical|http://listen.181fm.com/181-classical_128k.mp3\n"
+    "Galgaltz|http://glzwizzlv.bynetcdn.com/glz_mp3\n"
+    "Shanson|http://listen.rusongs.ru/ru-mp3-128\n"
+    "Kol Ha Musica|https://27873.live.streamtheworld.com/KAN_KOL_HAMUSICA.mp3\n"
+    "Radio Swiss Classic|http://stream.srg-ssr.ch/m/rsc_de/mp3_128\n"
+    "Radio Classique|https://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3\n"
+    "Classic FM|https://media-ssl.musicradio.com/ClassicFMMP3\n"
+    "WQXR|https://stream.wqxr.org/wqxr\n";
 
 const char *stations_path(void)
 {

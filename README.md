@@ -413,7 +413,13 @@ Name2|https://stream.example.com/live.mp3
 - The whole file is limited to 8 KB.
 
 Default stations: Radio Paradise, FIP (plus FIP Jazz and FIP Rock), France
-Inter, Dorozhnoe Radio, Evropa Plus, Retro FM, Vesti FM.
+Inter, Dorozhnoe Radio, Evropa Plus, Retro FM, 181.FM Classical, Galgaltz,
+Shanson, Kol Ha Musica, Radio Swiss Classic, Radio Classique, Classic FM,
+WQXR.
+
+The list carries a `# vN` marker line. When the marker in the file does not
+match the firmware's built-in version, the default list is rewritten on boot,
+so a new firmware release can ship an updated station list.
 
 ### `/spiffs/wifi.txt`
 
