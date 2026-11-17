@@ -50,6 +50,12 @@ void app_mode_set(app_mode_t mode)
         s_mode = APP_MODE_BT;
         radio_stop();
         audio_out_flush();
+        /*
+         * Let the radio task drop its decoder and TLS buffers first: the BT
+         * stack allocates its own tasks from internal RAM and HCI start-up
+         * fails if it races with the HTTPS client's teardown.
+         */
+        radio_wait_idle(16000);
         /* The stack is only brought up now: see bt_audio.h. */
         esp_err_t err = bt_audio_ensure_init();
         if (err == ESP_OK) {

@@ -38,6 +38,9 @@ static volatile uint32_t s_rate = 0;
 
 static char s_detail[80] = "idle";
 static SemaphoreHandle_t s_detail_lock;
+/* Given by the radio task whenever it is idle and has released the decoder.
+ * The BT stack waits for this before allocating its own tasks. */
+static SemaphoreHandle_t s_idle_sem;
 static HMP3Decoder s_decoder;
 static uint32_t s_decode_errors;
 
@@ -321,6 +324,9 @@ static void radio_task(void *arg)
             }
             if (s_want < 0) {
                 set_state(RADIO_STOPPED);
+                if (s_idle_sem != NULL) {
+                    xSemaphoreGive(s_idle_sem);
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -390,6 +396,10 @@ esp_err_t radio_init(void)
     if (s_detail_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_idle_sem = xSemaphoreCreateBinary();
+    if (s_idle_sem == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
     if (xTaskCreate(radio_task, "radio", TASK_STACK, NULL, TASK_PRIO, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -414,6 +424,10 @@ esp_err_t radio_play(int index)
 
 void radio_stop(void)
 {
+    /* Discard a stale "idle" notification from before this stop request. */
+    if (s_idle_sem != NULL) {
+        xSemaphoreTake(s_idle_sem, 0);
+    }
     s_want = -1;
     set_state(RADIO_STOPPED);
     set_detail("stopped");
@@ -438,6 +452,16 @@ void radio_prev(void)
     }
     int cur = s_want < 0 ? 0 : s_want;
     radio_play((cur - 1 + n) % n);
+}
+
+esp_err_t radio_wait_idle(uint32_t timeout_ms)
+{
+    if (s_idle_sem == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return xSemaphoreTake(s_idle_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
 }
 
 radio_state_t radio_get_state(void)

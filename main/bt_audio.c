@@ -36,12 +36,16 @@ static char s_remote_name[ESP_BT_GAP_MAX_BDNAME_LEN + 1] = "";
 static char s_detail[64] = "off";
 
 static bool s_stack_ready = false;
+static bool s_controller_inited = false;
+static bool s_controller_enabled = false;
 
 /*
  * The classic BT stack costs 60-90 KB of internal RAM, which the HTTPS
  * client needs for its TLS handshake.  It is therefore brought up lazily on
- * the first switch to Bluetooth mode and torn down again when the radio is
- * selected, so radio-only operation always has the full internal heap.
+ * the first switch to Bluetooth mode; when the radio is selected Bluedroid
+ * and the profiles are released and the controller is disabled.  The
+ * controller stays initialised because a full deinit/init cycle breaks
+ * inquiry scans (the device stops being discoverable on the next BT entry).
  */
 static SemaphoreHandle_t s_init_mutex = NULL;
 static SemaphoreHandle_t s_init_done = NULL;
@@ -328,15 +332,21 @@ esp_err_t bt_audio_init(void)
         return ESP_OK;
     }
 
-    esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "BLE memory release: %s", esp_err_to_name(err));
-    }
+    if (!s_controller_inited) {
+        esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "BLE memory release: %s", esp_err_to_name(err));
+        }
 
-    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_bt_controller_init(&cfg), TAG, "controller init");
-    ESP_RETURN_ON_ERROR(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT),
-                        TAG, "controller enable");
+        esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        ESP_RETURN_ON_ERROR(esp_bt_controller_init(&cfg), TAG, "controller init");
+        s_controller_inited = true;
+    }
+    if (!s_controller_enabled) {
+        ESP_RETURN_ON_ERROR(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT),
+                            TAG, "controller enable");
+        s_controller_enabled = true;
+    }
 
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_bluedroid_init_with_cfg(&bluedroid_cfg),
@@ -402,17 +412,18 @@ esp_err_t bt_audio_deinit(void)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    esp_err_t err = esp_a2d_sink_deinit();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "a2dp deinit: %s", esp_err_to_name(err));
-    }
-    err = esp_avrc_tg_deinit();
+    /* AVRCP must be torn down before A2DP (Bluedroid warns otherwise). */
+    esp_err_t err = esp_avrc_tg_deinit();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "avrc tg deinit: %s", esp_err_to_name(err));
     }
     err = esp_avrc_ct_deinit();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "avrc ct deinit: %s", esp_err_to_name(err));
+    }
+    err = esp_a2d_sink_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "a2dp deinit: %s", esp_err_to_name(err));
     }
     err = esp_bluedroid_disable();
     if (err != ESP_OK) {
@@ -422,20 +433,12 @@ esp_err_t bt_audio_deinit(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "bluedroid deinit: %s", esp_err_to_name(err));
     }
-    err = esp_bt_controller_disable();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "controller disable: %s", esp_err_to_name(err));
-    }
-    err = esp_bt_controller_deinit();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "controller deinit: %s", esp_err_to_name(err));
-    }
     /*
-     * Deliberately no esp_bt_controller_mem_release() here: it hands the
-     * controller's reserved regions to the general heap, so a later
-     * esp_bt_controller_init() would use memory that may already be
-     * allocated.  The dynamic allocations freed above are what the TLS
-     * handshake needs; the static regions were never part of the heap.
+     * Keep the controller initialised *and* enabled.  A full deinit/init
+     * cycle leaves the baseband unable to run inquiry scans again, and a
+     * disable/enable cycle can do the same, so the controller is brought up
+     * once and left running.  Bluedroid and the profiles, which hold the bulk
+     * of the internal RAM, are still released for the HTTPS client.
      */
 
     s_stack_ready = false;
@@ -471,13 +474,21 @@ esp_err_t bt_audio_set_enabled(bool enabled)
     s_enabled = enabled;
 
     if (enabled) {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+        esp_err_t err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                                 ESP_BT_GENERAL_DISCOVERABLE);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "set scan mode: %s", esp_err_to_name(err));
+        }
         ESP_LOGI(TAG, "discoverable as \"%s\"", BOARD_BT_NAME);
     } else {
         if (s_connected) {
             esp_a2d_sink_disconnect(s_remote_bda);
         }
-        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+        esp_err_t err = esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE,
+                                                 ESP_BT_NON_DISCOVERABLE);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "clear scan mode: %s", esp_err_to_name(err));
+        }
         s_connected = false;
         s_playing = false;
         audio_out_flush();

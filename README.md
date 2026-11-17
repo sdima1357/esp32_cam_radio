@@ -215,10 +215,15 @@ transfer-complete callback before reusing the buffer.
 
 ## Bluetooth
 
-The classic BT stack is started on the **first** switch to Bluetooth mode and
-released again when the radio is selected. It needs 60–90 KB of internal RAM,
-which the HTTPS client needs for its TLS handshake, so keeping it idle in
-radio mode made some HTTPS streams fail. Selecting Bluetooth mode:
+The classic BT stack is started on the **first** switch to Bluetooth mode.
+When the radio is selected, Bluedroid and the A2DP/AVRCP profiles are released,
+which returns most of the internal RAM that the HTTPS client needs for its TLS
+handshake. The controller itself is brought up once and never torn down: a
+full controller deinit/init cycle (and even a disable/enable cycle) succeeds
+at the HCI level but leaves the baseband unable to run inquiry scans again, so
+the device stops being discoverable on the second switch to Bluetooth. Leaving
+the controller enabled costs about 1 KB of internal RAM. Selecting Bluetooth
+mode:
 
 1. stops the radio stream and flushes the PCM buffer,
 2. starts the BT controller, Bluedroid, A2DP and AVRCP (takes about a second),
@@ -232,8 +237,8 @@ in both directions:
 - the encoder/console/web can send play/pause to the phone,
 - the phone's absolute volume control changes the local volume.
 
-Switching back to radio disconnects A2DP, tears the BT stack down (returning
-its RAM to the heap) and restarts the last station.
+Switching back to radio disconnects A2DP, releases Bluedroid and the profiles
+(returning most of their RAM to the heap) and restarts the last station.
 
 ## Web UI
 
@@ -471,17 +476,22 @@ Bluetooth A2DP sink ──────PCM──────────┘
   `/save` decodes the form body in place. The httpd task stack is 5 KB because
   the status JSON and the page buffer are built on the stack.
 - Bluetooth classic + Bluedroid + A2DP cost roughly 60–90 KB of internal RAM.
-  The stack is created on the first switch to Bluetooth mode and deleted when
-  the radio is selected again, so radio-only operation keeps the full internal
-  heap for TLS.
+  Bluedroid and the profiles are created on the first switch to Bluetooth mode
+  and deleted when the radio is selected again, so radio-only operation keeps
+  the internal heap for TLS. Only the controller's ~1 KB stays allocated.
 - mbedTLS uses the default allocator (`CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC`):
   large TLS buffers land in PSRAM, small ones in internal RAM. With the
   internal-only allocator the 16 KB input buffer did not fit next to WiFi.
 - The radio uses `esp_http_client_open()` + `read()` for streaming, and that
   path does not follow redirects by itself, so `radio.c` follows 3xx
   `Location` headers (up to 5 hops). Some stations (e.g. SRG SSR) need it.
-- OTA: the upload is streamed in 4 KB chunks straight to flash, so the update
-  path costs no extra RAM. The image is ~1.5 MB of the 1.75 MB slot.
+- OTA: the upload is received into PSRAM first and only then programmed into
+  flash. Programming flash disables the cache for a few milliseconds per 8 KB
+  chunk, which starves the WiFi task; with the 5.7 KB TCP window that closes
+  the window mid-upload and the sender backs off, stalling the transfer at a
+  random offset. Keeping the two phases apart makes the update take a steady
+  ~9 s instead of failing about half the time. The image is ~1.5 MB of the
+  1.75 MB slot, so the PSRAM buffer is 1.5 MB of the 4 MB available.
 
 ## Project layout
 

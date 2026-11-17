@@ -12,6 +12,7 @@
 #include "esp_http_server.h"
 #include "esp_check.h"
 #include "esp_ota_ops.h"
+#include "esp_heap_caps.h"
 #include "esp_app_desc.h"
 #include "esp_system.h"
 
@@ -434,51 +435,90 @@ static esp_err_t update_post(httpd_req_t *req)
 
     /* Stop the stream so the flash write does not fight the network task. */
     radio_stop();
+    /*
+     * Wait for the decoder and TLS buffers to be released before receiving
+     * the image: with an HTTPS station the teardown otherwise overlaps the
+     * upload and the TCP connection stalls part-way through.
+     */
+    radio_wait_idle(16000);
 
-    esp_ota_handle_t handle = 0;
-    esp_err_t err = esp_ota_begin(part, OTA_SIZE_UNKNOWN, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ota_begin: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin");
-        return ESP_FAIL;
-    }
+    const int total = req->content_len;
+    esp_err_t err = ESP_OK;
+    int written = 0;
 
-    char *buf = malloc(4096);
-    if (buf == NULL) {
-        esp_ota_abort(handle);
+    /*
+     * Receive the whole image into PSRAM before touching flash.
+     *
+     * Programming flash disables the cache for a few milliseconds per 8 KB
+     * chunk, which starves the WiFi task.  With the 5.7 KB TCP window that
+     * closes the window mid-upload, the sender backs off and the transfer
+     * stalls at a random offset.  Draining the socket first keeps the network
+     * and the flash phases from overlapping.
+     */
+    char *image = heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (image == NULL) {
+        ESP_LOGE(TAG, "no PSRAM for a %d byte image", total);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_FAIL;
     }
 
-    int remaining = req->content_len;
-    int written = 0;
+    int received = 0;
     int timeouts = 0;
-    bool ended = false;
-
-    while (remaining > 0) {
-        int want = remaining < 4096 ? remaining : 4096;
-        int r = httpd_req_recv(req, buf, want);
+    while (received < total) {
+        int r = httpd_req_recv(req, image + received, total - received);
         if (r == HTTPD_SOCK_ERR_TIMEOUT) {
             if (++timeouts > 10) {
-                err = ESP_FAIL;
                 break;
             }
             continue;
         }
         if (r <= 0) {
-            err = ESP_FAIL;
             break;
         }
         timeouts = 0;
-        err = esp_ota_write(handle, buf, r);
+        received += r;
+    }
+    if (received != total) {
+        ESP_LOGE(TAG, "upload incomplete: %d of %d bytes", received, total);
+        free(image);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "upload incomplete");
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t handle = 0;
+    err = esp_ota_begin(part, total, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ota_begin: %s", esp_err_to_name(err));
+        free(image);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin");
+        return ESP_FAIL;
+    }
+
+    /*
+     * esp_flash_write() copies a PSRAM source 32 bytes at a time, so stage the
+     * image through an internal buffer and let the other tasks run in between.
+     */
+    char *stage = heap_caps_malloc(8192, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (stage == NULL) {
+        esp_ota_abort(handle);
+        free(image);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    while (written < total) {
+        int n = total - written < 8192 ? total - written : 8192;
+        memcpy(stage, image + written, n);
+        err = esp_ota_write(handle, stage, n);
         if (err != ESP_OK) {
             break;
         }
-        remaining -= r;
-        written += r;
+        written += n;
+        vTaskDelay(1);
     }
-    free(buf);
+    free(stage);
+    free(image);
 
+    bool ended = false;
     if (err == ESP_OK) {
         /* Validates the image header and checksum. */
         err = esp_ota_end(handle);

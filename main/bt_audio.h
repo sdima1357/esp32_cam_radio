@@ -22,7 +22,9 @@ typedef enum {
  * internal RAM that the HTTPS client needs for its TLS handshake.  Call
  * bt_audio_preinit() once at startup (it only creates two semaphores), then
  * bt_audio_ensure_init() before using Bluetooth.  bt_audio_deinit() releases
- * the memory again when the radio is selected.
+ * Bluedroid and the profiles again when the radio is selected.  The
+ * controller itself stays initialised (but disabled): a full controller
+ * deinit/init cycle leaves the baseband unable to run inquiry scans again.
  */
 void bt_audio_preinit(void);
 
@@ -32,7 +34,7 @@ esp_err_t bt_audio_init(void);
 /* Idempotent: initialise the stack (in a dedicated task) if needed. */
 esp_err_t bt_audio_ensure_init(void);
 
-/* Tear the stack down and return its internal RAM to the heap. */
+/* Release Bluedroid/profiles and stop the controller (which stays initialised). */
 esp_err_t bt_audio_deinit(void);
 
 /* Make the speaker discoverable/connectable, or disconnect and hide it. */

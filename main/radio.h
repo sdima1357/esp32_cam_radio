@@ -23,6 +23,9 @@ esp_err_t radio_init(void);
 /* Start (or switch to) a station. Index is into the station list. */
 esp_err_t radio_play(int index);
 void radio_stop(void);
+
+/* Wait until the radio task has stopped and released the decoder/TLS buffers. */
+esp_err_t radio_wait_idle(uint32_t timeout_ms);
 void radio_next(void);
 void radio_prev(void);
 
